@@ -1,0 +1,21 @@
+{
+    "host": "0.0.0.0",
+    "port": 8080,
+    "auth_enabled": false,
+    "username": "admin",
+    "password": "password",
+    "rate_limit_enabled": true,
+    "max_requests_per_minute": 100,
+    "allowed_ips": [],
+    "blocked_ips": [],
+    "log_level": "INFO",
+    "log_file": "proxy.log",
+    "optimize_for_gaming": true,
+    "buffer_size": 16384,
+    "timeout": 3,
+    "target_servers": ["mc.hypixel.net"],
+    "tcp_nodelay": true,
+    "tcp_keepalive": true,
+    "tcp_keepalive_interval": 30,
+    "tcp_keepalive_probes": 3
+} 
