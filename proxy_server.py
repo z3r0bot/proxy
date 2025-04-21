@@ -262,6 +262,7 @@ class ProxyServer:
     def handle_client(self, client_socket, client_address):
         """Handle individual client connections"""
         client_ip = client_address[0]
+        server_socket = None
         try:
             # Set TCP_NODELAY for lower latency
             if self.config.get("tcp_nodelay", True):
@@ -270,16 +271,6 @@ class ProxyServer:
             # Set TCP keepalive
             if self.config.get("tcp_keepalive", True):
                 client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-                # Set keepalive parameters if supported
-                try:
-                    client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 
-                                            self.config.get("tcp_keepalive_interval", 30))
-                    client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 
-                                            self.config.get("tcp_keepalive_interval", 30))
-                    client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 
-                                            self.config.get("tcp_keepalive_probes", 3))
-                except:
-                    pass
                 
             # Check authentication if enabled
             if self.config.get("auth_enabled", False):
@@ -293,25 +284,115 @@ class ProxyServer:
             if not data:
                 return
 
-            # Parse the request to get target host and port
+            # Try to parse the data as HTTP first
             try:
-                # Decode the request data
+                # Attempt to decode the request data
                 request_data = data.decode('utf-8', errors='ignore')
                 
-                # Check if this is a CONNECT request (HTTPS)
-                if request_data.startswith('CONNECT'):
-                    # Handle CONNECT request
-                    parts = request_data.split(' ', 2)
-                    if len(parts) >= 2:
-                        host_port = parts[1]
+                # Check if this is an HTTP request (starts with a method like GET, POST, CONNECT)
+                if request_data.startswith(('GET ', 'POST ', 'HEAD ', 'PUT ', 'DELETE ', 'CONNECT ')):
+                    # This is an HTTP request, handle it as such
+                    if request_data.startswith('CONNECT'):
+                        # Handle CONNECT request
+                        parts = request_data.split(' ', 2)
+                        if len(parts) >= 2:
+                            host_port = parts[1]
+                            if ':' in host_port:
+                                host, port = host_port.split(':')
+                                port = int(port)
+                            else:
+                                host = host_port
+                                port = 443
+                                
+                            self.logger.info(f"CONNECT request to {host}:{port} from {client_ip}")
+                            
+                            # Create connection to target server
+                            server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                            
+                            # Set TCP_NODELAY for lower latency
+                            if self.config.get("tcp_nodelay", True):
+                                server_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                                
+                            # Set TCP keepalive
+                            if self.config.get("tcp_keepalive", True):
+                                server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                                
+                            # Set timeout
+                            timeout = self.config.get("timeout", 3)
+                            server_socket.settimeout(timeout)
+                            
+                            # Connect to target server
+                            server_socket.connect((host, port))
+                            
+                            # Send 200 Connection Established
+                            client_socket.send(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                            
+                            # Start forwarding data
+                            self.forward_data(client_socket, server_socket, client_ip)
+                        else:
+                            self.logger.error(f"Invalid CONNECT request format: {request_data}")
+                    else:
+                        # Handle other HTTP requests
+                        lines = request_data.split('\n')
+                        if not lines:
+                            self.logger.error(f"Empty request from {client_ip}")
+                            return
+                            
+                        first_line = lines[0].strip()
+                        parts = first_line.split(' ', 2)
+                        
+                        if len(parts) < 2:
+                            self.logger.error(f"Invalid request format: {first_line}")
+                            return
+                            
+                        method = parts[0]
+                        url = parts[1]
+                        
+                        # Log the request
+                        self.logger.info(f"Request: {method} {url} from {client_ip}")
+                        
+                        # Extract host and port from URL or Host header
+                        host = None
+                        port = 80
+                        
+                        # Try to get host from URL
+                        if '://' in url:
+                            protocol, rest = url.split('://', 1)
+                            if '/' in rest:
+                                host_port, path = rest.split('/', 1)
+                            else:
+                                host_port = rest
+                                path = ''
+                        else:
+                            host_port = url
+                            path = ''
+                            
                         if ':' in host_port:
                             host, port = host_port.split(':')
                             port = int(port)
                         else:
                             host = host_port
-                            port = 443
                             
-                        self.logger.info(f"CONNECT request to {host}:{port} from {client_ip}")
+                        # If host is still None, try to get it from Host header
+                        if host is None:
+                            for line in lines[1:]:
+                                if line.lower().startswith('host:'):
+                                    host = line.split(':', 1)[1].strip()
+                                    if ':' in host:
+                                        host, port = host.split(':')
+                                        port = int(port)
+                                    break
+                                    
+                        if host is None:
+                            self.logger.error(f"Could not determine host from request: {request_data}")
+                            return
+                            
+                        # Check if this is a Hypixel server connection
+                        is_hypixel = any(target in host for target in self.config.get("target_servers", ["mc.hypixel.net"]))
+                        if is_hypixel:
+                            self.logger.info(f"Hypixel connection detected: {host}:{port}")
+                            
+                        self.logger.info(f"Connecting to {host}:{port}")
                         
                         # Create connection to target server
                         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -331,131 +412,177 @@ class ProxyServer:
                         # Connect to target server
                         server_socket.connect((host, port))
                         
-                        # Send 200 Connection Established
-                        client_socket.send(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                        # Forward the request
+                        server_socket.send(data)
                         
                         # Start forwarding data
                         self.forward_data(client_socket, server_socket, client_ip)
-                    else:
-                        self.logger.error(f"Invalid CONNECT request format: {request_data}")
-                        return
                 else:
-                    # Handle HTTP request
-                    lines = request_data.split('\n')
-                    if not lines:
-                        self.logger.error(f"Empty request from {client_ip}")
-                        return
-                        
-                    first_line = lines[0].strip()
-                    parts = first_line.split(' ', 2)
-                    
-                    if len(parts) < 2:
-                        self.logger.error(f"Invalid request format: {first_line}")
-                        return
-                        
-                    method = parts[0]
-                    url = parts[1]
-                    
-                    # Log the request
-                    self.logger.info(f"Request: {method} {url} from {client_ip}")
-                    
-                    # Extract host and port from URL or Host header
-                    host = None
-                    port = 80
-                    
-                    # Try to get host from URL
-                    if '://' in url:
-                        protocol, rest = url.split('://', 1)
-                        if '/' in rest:
-                            host_port, path = rest.split('/', 1)
-                        else:
-                            host_port = rest
-                            path = ''
+                    # This is not an HTTP request, might be Minecraft protocol or other binary protocol
+                    # Check if it's a SOCKS request
+                    if len(data) > 0 and data[0] == 5:  # SOCKS5
+                        self.handle_socks5(client_socket, data, client_ip)
                     else:
-                        host_port = url
-                        path = ''
+                        # Assume it's a direct connection to Hypixel
+                        # Default to Hypixel server if not an HTTP request
+                        host = self.config.get("target_servers", ["mc.hypixel.net"])[0]
+                        port = 25565  # Default Minecraft port
                         
-                    if ':' in host_port:
-                        host, port = host_port.split(':')
-                        port = int(port)
-                    else:
-                        host = host_port
+                        self.logger.info(f"Direct connection to Minecraft server: {host}:{port}")
                         
-                    # If host is still None, try to get it from Host header
-                    if host is None:
-                        for line in lines[1:]:
-                            if line.lower().startswith('host:'):
-                                host = line.split(':', 1)[1].strip()
-                                if ':' in host:
-                                    host, port = host.split(':')
-                                    port = int(port)
-                                break
-                                
-                    if host is None:
-                        self.logger.error(f"Could not determine host from request: {request_data}")
-                        return
+                        # Create connection to target server
+                        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                         
-                    # Check if this is a Hypixel server connection
-                    is_hypixel = any(target in host for target in self.config.get("target_servers", ["mc.hypixel.net"]))
-                    if is_hypixel:
-                        self.logger.info(f"Hypixel connection detected: {host}:{port}")
+                        # Set TCP_NODELAY for lower latency
+                        if self.config.get("tcp_nodelay", True):
+                            server_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                            
+                        # Set TCP keepalive
+                        if self.config.get("tcp_keepalive", True):
+                            server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                            
+                        # Set timeout
+                        timeout = self.config.get("timeout", 3)
+                        server_socket.settimeout(timeout)
                         
-                    self.logger.info(f"Connecting to {host}:{port}")
-                    
-                    # Create connection to target server
-                    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    
-                    # Set TCP_NODELAY for lower latency
-                    if self.config.get("tcp_nodelay", True):
-                        server_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                        # Connect to target server
+                        server_socket.connect((host, port))
                         
-                    # Set TCP keepalive
-                    if self.config.get("tcp_keepalive", True):
-                        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                        # Forward the initial data
+                        server_socket.send(data)
                         
-                    # Set timeout
-                    timeout = self.config.get("timeout", 3)
-                    server_socket.settimeout(timeout)
-                    
-                    # Connect to target server
-                    server_socket.connect((host, port))
-                    
-                    # Forward the request
-                    server_socket.send(data)
-                    
-                    # Start forwarding data
-                    self.forward_data(client_socket, server_socket, client_ip)
+                        # Start forwarding data
+                        self.forward_data(client_socket, server_socket, client_ip)
             except Exception as e:
                 self.logger.error(f"Error handling request: {e}")
                 return
         except Exception as e:
             self.logger.error(f"Error in client handler: {e}")
         finally:
-            client_socket.close()
+            if client_socket:
+                client_socket.close()
+            if server_socket:
+                server_socket.close()
             if client_socket in self.clients:
                 self.clients.remove(client_socket)
+    
+    def handle_socks5(self, client_socket, initial_data, client_ip):
+        """Handle SOCKS5 protocol"""
+        try:
+            # Send back auth methods response
+            client_socket.send(b"\x05\x00")  # No authentication required
+            
+            # Receive connect request
+            data = client_socket.recv(4096)
+            if not data or len(data) < 7 or data[0] != 5 or data[1] != 1:  # Must be SOCKS5 CONNECT
+                self.logger.error("Invalid SOCKS5 connect request")
+                client_socket.close()
+                return
                 
+            # Parse address type
+            atyp = data[3]
+            if atyp == 1:  # IPv4
+                if len(data) < 10:
+                    self.logger.error("Invalid IPv4 address in SOCKS5 request")
+                    client_socket.close()
+                    return
+                host = socket.inet_ntoa(data[4:8])
+                port = (data[8] << 8) + data[9]
+            elif atyp == 3:  # Domain name
+                domain_len = data[4]
+                if len(data) < 5 + domain_len + 2:
+                    self.logger.error("Invalid domain in SOCKS5 request")
+                    client_socket.close()
+                    return
+                host = data[5:5+domain_len].decode('utf-8', errors='ignore')
+                port = (data[5+domain_len] << 8) + data[5+domain_len+1]
+            else:
+                self.logger.error(f"Unsupported address type in SOCKS5: {atyp}")
+                client_socket.close()
+                return
+                
+            self.logger.info(f"SOCKS5 request to {host}:{port} from {client_ip}")
+            
+            # Create connection to target server
+            server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            
+            # Set TCP_NODELAY for lower latency
+            if self.config.get("tcp_nodelay", True):
+                server_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                
+            # Set TCP keepalive
+            if self.config.get("tcp_keepalive", True):
+                server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                
+            # Set timeout
+            timeout = self.config.get("timeout", 3)
+            server_socket.settimeout(timeout)
+            
+            try:
+                # Connect to target server
+                server_socket.connect((host, port))
+                
+                # Send success response
+                # Use the same address format as the request
+                if atyp == 1:  # IPv4
+                    client_socket.send(b"\x05\x00\x00\x01" + socket.inet_aton(host) + 
+                                      data[8:10])
+                elif atyp == 3:  # Domain name
+                    client_socket.send(b"\x05\x00\x00\x03" + bytes([domain_len]) + 
+                                      host.encode('utf-8') + data[5+domain_len:5+domain_len+2])
+                
+                # Start forwarding data
+                self.forward_data(client_socket, server_socket, client_ip)
+            except Exception as e:
+                self.logger.error(f"Error connecting to target in SOCKS5: {e}")
+                client_socket.send(b"\x05\x04\x00\x01\x00\x00\x00\x00\x00\x00")  # Host unreachable
+                client_socket.close()
+                server_socket.close()
+                return
+                
+        except Exception as e:
+            self.logger.error(f"Error in SOCKS5 handler: {e}")
+            if client_socket:
+                client_socket.close()
+    
     def forward_data(self, client_socket, server_socket, client_ip):
         """Forward data between client and server sockets"""
         buffer_size = self.config.get("buffer_size", 16384)
         
+        # Set sockets to non-blocking mode
+        client_socket.setblocking(0)
+        server_socket.setblocking(0)
+        
         # Set up select for non-blocking I/O
         while True:
-            readable, _, _ = select.select([client_socket, server_socket], [], [], 1)
-            
-            for sock in readable:
-                other = server_socket if sock is client_socket else client_socket
-                try:
-                    data = sock.recv(buffer_size)
-                    if not data:
+            try:
+                # Wait for data on either socket
+                readable, _, exceptional = select.select([client_socket, server_socket], [], 
+                                                        [client_socket, server_socket], 1)
+                
+                if exceptional:
+                    break
+                
+                for sock in readable:
+                    other = server_socket if sock is client_socket else client_socket
+                    try:
+                        data = sock.recv(buffer_size)
+                        if not data:
+                            return
+                        other.send(data)
+                    except socket.timeout:
+                        self.logger.warning(f"Socket timeout for {client_ip}")
                         return
-                    other.send(data)
-                except socket.timeout:
-                    self.logger.warning(f"Socket timeout for {client_ip}")
-                    return
-                except Exception as e:
-                    self.logger.error(f"Error forwarding data: {e}")
-                    return
+                    except (ConnectionRefusedError, ConnectionResetError, ConnectionAbortedError,
+                            BrokenPipeError):
+                        self.logger.warning(f"Connection error for {client_ip}")
+                        return
+                    except Exception as e:
+                        self.logger.error(f"Error forwarding data: {e}")
+                        return
+            except Exception as e:
+                self.logger.error(f"Error in forward loop: {e}")
+                return
 
 if __name__ == "__main__":
     # Parse command line arguments
